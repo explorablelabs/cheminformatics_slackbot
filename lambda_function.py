@@ -1,39 +1,35 @@
 import os
 import json
 import logging
-import urllib
 import hashlib
 import hmac
 from botocore.vendored import requests
 import json
 
-# Grab the Bot OAuth token from the environment.
-BOT_TOKEN = os.environ["BOT_TOKEN"]
+# Grab the signing secret from the environment so we can ensure this request came from the app we expect.
 slack_signing_secret = os.environ["SIGNING_SECRET"]
 
-# Define the URL of the targeted Slack API resource.
-# We'll send our replies there.
-SLACK_URL = "https://slack.com/api/chat.postMessage"
+# Send our replies to the targeted Slack resource.
+webhook_url = 'https://hooks.slack.com/services/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'
 
 logger = logging.getLogger()
 logger.setLevel(logging.WARNING)
 
-''' Verify the POST request. '''
 def verify_slack_request(slack_signature=None, slack_request_timestamp=None, request_body=None):
-    ''' Form the basestring as stated in the Slack API docs. We need to make a bytestring. '''
-    
+    '''
+    The steps here are outlined in the Slack docs - check for our signing secret in the message.
+    '''
     basestring = f"v0:{slack_request_timestamp}:{request_body}".encode('utf-8')
 
-    ''' Make the Signing Secret a bytestring too. '''
+    # Make the Signing Secret a bytestring too.
     slack_signing_secret_bytes = bytes(slack_signing_secret, 'utf-8')
 
-    ''' Create a new HMAC "signature", and return the string presentation. '''
+    #Create a new HMAC "signature", and return the string presentation.
     my_signature = 'v0=' + hmac.new(slack_signing_secret_bytes, basestring, hashlib.sha256).hexdigest()
 
     ''' Compare the the Slack provided signature to ours.
     If they are equal, the request should be verified successfully.
-    Log the unsuccessful requests for further analysis
-    (along with another relevant info about the request). '''
+    Log the unsuccessful requests for further analysis. '''
     if hmac.compare_digest(my_signature, slack_signature):
         return True
     else:
@@ -43,88 +39,62 @@ def verify_slack_request(slack_signature=None, slack_request_timestamp=None, req
 
 ''' Process the POST request from API Gateway proxy integration. '''
 def post(event, context):
+    '''
+    
+    '''
     try:
-        ''' Incoming data from Slack is application/x-www-form-urlencoded and UTF-8. '''
-
-        ''' Capture the necessary data. '''
-        slack_signature = event['headers']['X-Slack-Signature']
-        slack_request_timestamp = event['headers']['X-Slack-Request-Timestamp']
 
         ''' Verify the request. '''
+        slack_signature = event['headers']['X-Slack-Signature']
+        slack_request_timestamp = event['headers']['X-Slack-Request-Timestamp']
         if not verify_slack_request(slack_signature, slack_request_timestamp, event['body']):
             logger.info('Bad request.')
             response = {
-                "statusCode": 400,
+                "status_code": 400,
                 "body": ''
             }
             return response
+        else:
+            # Send 200 response so Slack knows we received the message, then continue processing
+            # (If we take too long to respond, Slack may re-send the request.)
+            response = requests.post(
+                webhook_url, json={"status_code": 200, "body": ''},
+                headers={'Content-Type': 'application/json'}
+            )
 
         body = event["body"]
         parsed_body = json.loads(body)
-        print(parsed_body)
         this_event = parsed_body["event"]
-        print(this_event)
         text = this_event["text"]
         
         # Get chemical descriptors of text, if possible
         apiurl = 'https://api.explorablelabs.com/descriptors/smiles/' + text
         headers = {'Content-Type': 'application/json'}
         r = requests.get(apiurl, headers=headers)
-        print(r.status_code)
-        print(r.text)
-        descriptor_text = json.dumps(r.text)
+        logger.info(r.text) # Can view response from API in Cloudwatch logs
         
-        # We need to send back three pieces of information:
-        #     1. The reversed text (text)
-        #     2. The channel id of the private, direct chat (channel)
-        #     3. The OAuth token required to communicate with 
-        #        the API (token)
-        # Then, create an associative array and URL-encode it, 
-        # since the Slack API doesn't not handle JSON (bummer).
+        if "Internal Server Error" in r.text:
+            descriptor_text = "Not a valid SMILES string!"
+        else:
+            #Nicely format descriptors for return response
+            descriptors_dict = json.loads(r.text)
+            descriptor_text = ""
+            for descriptor in descriptors_dict:
+                descriptor_text += "*%s:* " % descriptor
+                descriptor_text += str(descriptors_dict[descriptor]) + "\n"
         
-        # Get the ID of the channel where the message was posted.
-        channel_id = this_event["channel"]
-        
-        #Hm, this is not working
-        #response = {
-        #    "statusCode": 200,
-        #    "body": {
-        #        "token": BOT_TOKEN,
-        #        "channel": channel_id,
-        #        "text": descriptor_text
-        #    }
-        #}
-        #return response
-        
-        data = urllib.parse.urlencode(
-            (
-                ("token", BOT_TOKEN),
-                ("channel", channel_id),
-                ("text", descriptor_text)
-            )
+        response = requests.post(
+            webhook_url, json={"text": descriptor_text},
+            headers={'Content-Type': 'application/json'}
         )
-        data = data.encode("ascii")
-        
-        # Construct the HTTP request that will be sent to the Slack API.
-        request = urllib.request.Request(
-            SLACK_URL, 
-            data=data, 
-            method="POST"
-        )
-        # Add a header mentioning that the text is URL-encoded.
-        request.add_header(
-            "Content-Type", 
-            "application/x-www-form-urlencoded"
-        )
-        
-        # Fire off the request!
-        urllib.request.urlopen(request).read()
+        logger.info(response.status_code) # Non-200 status_code = problem
+        return response.status_code
 
     except Exception as e:
-        ''' Just a stub. Please make this better in real use :) '''
+        ''' Just a stub. ERROR: messages can be viewed in the Cloudwatch logs'''
         logger.error(f"ERROR: {e}")
         response = {
-            "statusCode": 200,
+            "status_code": 200,
             "body": ''
         }
         return response
@@ -135,15 +105,16 @@ def lambda_handler(data, context):
     
     body = data["body"]
     parsed_body = json.loads(body)
+    
+    # The challenge field is used by Slack to verify the bot
     if "challenge" in parsed_body:
         response = {
-            "statusCode": 200,
+            "status_code": 200,
             "body": parsed_body["challenge"]
         }
         return response
 
     # Grab the Slack event data.
-    print(parsed_body)
     slack_event = parsed_body['event']
     
     # We need to discriminate between events generated by 
@@ -154,6 +125,9 @@ def lambda_handler(data, context):
     else:
         post(data, context)
         
-    # Everything went fine.
-    return "200 OK"
+    response = {
+        "status_code": 200,
+        "body": ''
+    }
+    return response
     
